@@ -1,7 +1,7 @@
 """
 End-to-end pipeline for the attention-fatigue EEG thesis.
 """
-import matplotlib.pyplot as plt
+
 import argparse
 import sys
 from pathlib import Path
@@ -11,15 +11,20 @@ import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from config import BANDS, PRIMARY_BANDS, PRE_FATIGUE_SEC, MAIN_BLOCKS
+from config import (
+    BANDS, PRIMARY_BANDS, PRE_FATIGUE_SEC, BASELINE_BLOCKS, MAIN_BLOCKS,
+    EEG_WINDOW_SEC, EEG_WINDOW_OVERLAP,
+)
 from data_io import load_eeg, load_exp, discover_participants
 from eeg_preprocessing import preprocess_eeg
 from eeg_features import extract_window_features
 from behavioral_fatigue import (
     compute_baseline_performance, sliding_window_performance, detect_fatigue_onset,
+    align_windows_to_onset,
 )
 from fatigue_eeg_analysis import (
     get_baseline_eeg_window, compute_baseline_eeg_power, normalize_features,
@@ -31,18 +36,11 @@ from statistics_analysis import per_participant_stats, group_level_stats
 def process_participant(pid: str, eeg_path: Union[str, Path], exp_path: Union[str, Path],
                         out_dir: Union[str, Path]) -> Tuple[Dict[str, object],
                                                              Optional[pd.DataFrame],
-                                                             Optional[Dict[str, object]]]:
+                                                             Optional[Dict[str, object]],
+                                                             Optional[pd.DataFrame],
+                                                             Optional[pd.DataFrame]]:
     """
-    Run the full single-participant pipeline (steps 1-7 in the module
-    docstring): load, filter, behavioural fatigue detection, EEG spectral
-    features, baseline normalisation, per-participant stats, and figures.
-
-    Returns (result, stats_df, p_means):
-        result   : dict of summary fields for this participant (always returned)
-        stats_df : per-participant baseline-vs-prefatigue stats DataFrame,
-                   or None if no fatigue onset was detected
-        p_means  : dict of participant-level band/channel differences for the
-                   group-level test, or None if no fatigue onset was detected
+    Run the full single-participant pipeline
     """
     print(f"\n=== Participant {pid} ===")
     out_dir = Path(out_dir) / f"P{pid}"
@@ -87,16 +85,27 @@ def process_participant(pid: str, eeg_path: Union[str, Path], exp_path: Union[st
 
     result = {
         "participant": pid, "fs": fs, "n_eeg_windows": len(features),
-        "n_artifact_windows": int(n_artifact), **baseline_perf, **onset,
+        "n_artifact_windows": int(n_artifact), "eeg_valid": False,
+        **baseline_perf, **onset,
     }
 
     if not onset["fatigue_detected"]:
         pd.DataFrame([result]).to_csv(out_dir / "summary.csv", index=False)
-        return result, None, None
+        return result, None, None, None, None
 
-    baseline_power = compute_baseline_eeg_power(features, b_start, b_end)
+    try:
+        baseline_power = compute_baseline_eeg_power(features, b_start, b_end)
+    except ValueError as e:
+        print(f"  WARNING: invalid EEG baseline for participant {pid} ({e}); "
+              f"excluding this participant from all EEG-based analyses/figures.")
+        pd.DataFrame([result]).to_csv(out_dir / "summary.csv", index=False)
+        return result, None, None, None, None
+
+    result["eeg_valid"] = True
+
     features_norm = normalize_features(features, baseline_power)
     prefatigue = extract_prefatigue_interval(features_norm, onset["onset_time_s"])
+    prefatigue["participant"] = pid
     prefatigue.to_csv(out_dir / "prefatigue_eeg_normalized.csv", index=False)
 
     prefatigue_raw = extract_prefatigue_interval(features, onset["onset_time_s"])
@@ -111,6 +120,7 @@ def process_participant(pid: str, eeg_path: Union[str, Path], exp_path: Union[st
           f"final {PRE_FATIGUE_SEC:.0f}s before onset")
 
     stats_df = per_participant_stats(baseline_raw, prefatigue_raw)
+    stats_df["participant"] = pid
     stats_df.to_csv(out_dir / "baseline_vs_prefatigue_stats.csv", index=False)
     print(f"  Baseline: {len(baseline_raw)} clean windows | Pre-fatigue: {len(prefatigue_raw)} clean windows")
     primary = stats_df[stats_df["outcome_type"] == "primary"]
@@ -131,7 +141,10 @@ def process_participant(pid: str, eeg_path: Union[str, Path], exp_path: Union[st
     make_baseline_prefatigue_figure(pid, baseline_raw, prefatigue_raw, "theta", out_dir)
     make_baseline_prefatigue_figure(pid, baseline_raw, prefatigue_raw, "alpha", out_dir)
 
-    return result, stats_df, p_means
+    aligned_windows = align_windows_to_onset(windows_perf, onset["onset_time_s"])
+    aligned_windows["participant"] = pid
+
+    return result, stats_df, p_means, aligned_windows, prefatigue
 
 
 def make_participant_figure(pid: str, windows_perf: pd.DataFrame, baseline_perf: Dict[str, object],
@@ -181,8 +194,7 @@ def make_baseline_prefatigue_figure(pid: str, baseline_raw: pd.DataFrame, prefat
     Shows the per-window distribution (boxplot) of frontal <band> power
     during the baseline period (practice + no-feedback) against the final
     PRE_FATIGUE_SEC window preceding the detected fatigue onset, with the
-    per-condition mean overlaid. This is the direct visual counterpart to
-    the descriptive comparison computed in per_participant_stats().
+    per-condition mean overlaid.
     """
     col = f"frontal_{band}_power"
 
@@ -210,13 +222,183 @@ def make_baseline_prefatigue_figure(pid: str, baseline_raw: pd.DataFrame, prefat
     plt.close(fig)
 
 
+def make_group_behavioral_trajectory_figure(aligned_windows_df: pd.DataFrame,
+                                             out_dir: Union[str, Path]) -> None:
+    """
+    Figure 1: participant-level behavioural (error-rate) trajectories aligned
+    to each participant's own detected fatigue onset (t=0).
+    """
+    out_dir = Path(out_dir)
+    if aligned_windows_df is None or aligned_windows_df.empty:
+        print("\n[figures] No participants with a detected fatigue onset and valid "
+              "EEG data -- skipping group behavioural trajectory figure.")
+        return
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for pid, grp in aligned_windows_df.groupby("participant"):
+        grp = grp.sort_values("time_to_onset")
+        ax.plot(grp["time_to_onset"], grp["error_rate"], marker="o", markersize=2,
+                 linewidth=1, alpha=0.8, label=f"P{pid}")
+    ax.axvline(0, color="crimson", linestyle=":", label="fatigue onset")
+    ax.set_xlabel("Time to fatigue onset (s)")
+    ax.set_ylabel("Error rate (20-trial window)")
+    ax.set_title("Participant-level behavioural trajectories around fatigue onset")
+    ax.legend(fontsize=7, ncol=2)
+    fig.tight_layout()
+    fig.savefig(out_dir / "group_behavioral_trajectories.png", dpi=150)
+    plt.close(fig)
+
+
+def make_group_baseline_prefatigue_figure(all_stats_df: pd.DataFrame, band: str,
+                                          out_dir: Union[str, Path]) -> None:
+    """
+    Figures 2 & 3: participant-level frontal <band> power during baseline vs.
+    the final PRE_FATIGUE_SEC preceding fatigue onset. One paired
+    baseline -> pre-fatigue line per participant.
+    """
+    out_dir = Path(out_dir)
+    if all_stats_df is None or all_stats_df.empty:
+        print(f"\n[figures] No participant stats available -- skipping group "
+              f"frontal {band} baseline-vs-prefatigue figure.")
+        return
+
+    sub = all_stats_df[(all_stats_df["channel"] == "frontal") & (all_stats_df["band"] == band)]
+    if sub.empty:
+        print(f"\n[figures] No frontal {band} rows found -- skipping group "
+              f"frontal {band} baseline-vs-prefatigue figure.")
+        return
+
+    fig, ax = plt.subplots(figsize=(5, 5))
+    for _, row in sub.iterrows():
+        ax.plot([0, 1], [row["mean_baseline"], row["mean_prefatigue"]],
+                 marker="o", color="steelblue", alpha=0.6)
+    ax.set_xlim(-0.3, 1.3)
+    ax.set_xticks([0, 1])
+    ax.set_xticklabels(["Baseline", "Pre-fatigue"])
+    ax.set_ylabel(f"Frontal {band} power (AF7/AF8 avg)")
+    ax.set_title(f"Participant-level frontal {band} power: baseline vs. pre-fatigue")
+    fig.tight_layout()
+    fig.savefig(out_dir / f"group_frontal_{band}_baseline_vs_prefatigue.png", dpi=150)
+    plt.close(fig)
+
+
+def make_group_change_figure(all_stats_df: pd.DataFrame, out_dir: Union[str, Path]) -> None:
+    """
+    Figure 4: participant-level change (pre-fatigue minus baseline) in
+    frontal theta and alpha power -- the predefined primary outcomes.
+    """
+    out_dir = Path(out_dir)
+    if all_stats_df is None or all_stats_df.empty:
+        print("\n[figures] No participant stats available -- skipping primary change figure.")
+        return
+
+    primary = all_stats_df[all_stats_df["outcome_type"] == "primary"]
+    if primary.empty:
+        print("\n[figures] No primary-outcome rows found -- skipping primary change figure.")
+        return
+
+    bands = sorted(primary["band"].unique())
+    rng = np.random.default_rng(0)
+    fig, ax = plt.subplots(figsize=(6, 5))
+    for i, band in enumerate(bands, start=1):
+        vals = primary[primary["band"] == band]["difference_prefatigue_minus_baseline"].dropna().to_numpy(dtype=float)
+        jitter = rng.uniform(-0.08, 0.08, size=len(vals))
+        ax.scatter(np.full(len(vals), i) + jitter, vals, alpha=0.6, color="steelblue", zorder=1)
+        if len(vals):
+            ax.scatter([i], [np.mean(vals)], marker="D", s=60, color="crimson", zorder=3)
+    ax.axhline(0, color="gray", linestyle="--")
+    ax.set_xticks(range(1, len(bands) + 1))
+    ax.set_xticklabels(bands)
+    ax.set_ylabel("Pre-fatigue minus baseline power (frontal)")
+    ax.set_title("Participant-level change in frontal theta/alpha power")
+    fig.tight_layout()
+    fig.savefig(out_dir / "group_primary_change.png", dpi=150)
+    plt.close(fig)
+
+
+def make_group_exploratory_change_figure(all_stats_df: pd.DataFrame, out_dir: Union[str, Path]) -> None:
+    """
+    Figure 5: exploratory participant-level changes (pre-fatigue minus
+    baseline) for TP9, TP10, and frontal beta power. Descriptive only --
+    these outcomes are not tested for significance, per the methodology.
+    """
+    out_dir = Path(out_dir)
+    if all_stats_df is None or all_stats_df.empty:
+        print("\n[figures] No participant stats available -- skipping exploratory change figure.")
+        return
+
+    exploratory = all_stats_df[all_stats_df["outcome_type"] == "exploratory"]
+    if exploratory.empty:
+        print("\n[figures] No exploratory-outcome rows found -- skipping exploratory change figure.")
+        return
+
+    groups = exploratory.groupby(["channel", "band"])
+    labels = sorted(groups.groups.keys())
+    rng = np.random.default_rng(0)
+    fig, ax = plt.subplots(figsize=(9, 5))
+    for i, key in enumerate(labels, start=1):
+        vals = groups.get_group(key)["difference_prefatigue_minus_baseline"].dropna().to_numpy(dtype=float)
+        jitter = rng.uniform(-0.08, 0.08, size=len(vals))
+        ax.scatter(np.full(len(vals), i) + jitter, vals, alpha=0.5, color="steelblue", zorder=1)
+        if len(vals):
+            ax.scatter([i], [np.mean(vals)], marker="D", s=60, color="crimson", zorder=3)
+    ax.axhline(0, color="gray", linestyle="--")
+    ax.set_xticks(range(1, len(labels) + 1))
+    ax.set_xticklabels([f"{ch}\n{band}" for ch, band in labels], fontsize=8)
+    ax.set_ylabel("Pre-fatigue minus baseline power")
+    ax.set_title("Exploratory participant-level power changes (TP9, TP10, beta)")
+    fig.tight_layout()
+    fig.savefig(out_dir / "group_exploratory_change.png", dpi=150)
+    plt.close(fig)
+
+
+def make_group_temporal_evolution_figure(prefatigue_norm_df: pd.DataFrame,
+                                         out_dir: Union[str, Path]) -> None:
+    """
+    Figure 6: group-level temporal evolution of baseline-normalised frontal
+    theta/alpha power during the PRE_FATIGUE_SEC preceding fatigue onset.
+    """
+    out_dir = Path(out_dir)
+    if prefatigue_norm_df is None or prefatigue_norm_df.empty:
+        print("\n[figures] No baseline-normalised pre-fatigue EEG data available -- "
+              "skipping group temporal evolution figure.")
+        return
+
+    bin_width = EEG_WINDOW_SEC * (1 - EEG_WINDOW_OVERLAP)
+    n_bins = max(1, int(round(PRE_FATIGUE_SEC / bin_width)))
+    edges = np.linspace(-PRE_FATIGUE_SEC, 0, n_bins + 1)
+
+    df = prefatigue_norm_df.copy()
+    df["time_bin"] = pd.cut(df["time_to_onset"], bins=edges, include_lowest=True)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for band, color in zip(PRIMARY_BANDS, ["tab:orange", "tab:green"]):
+        col = f"frontal_{band}_power"
+        grouped = df.groupby("time_bin", observed=True)[col].agg(["mean", "sem", "count"]).reset_index()
+        grouped["bin_center"] = grouped["time_bin"].apply(lambda iv: iv.mid if pd.notna(iv) else np.nan)
+        grouped = grouped.dropna(subset=["bin_center", "mean"])
+        if grouped.empty:
+            continue
+        ax.plot(grouped["bin_center"], grouped["mean"], marker="o", color=color, label=f"frontal {band}")
+        ax.fill_between(grouped["bin_center"],
+                         grouped["mean"] - grouped["sem"],
+                         grouped["mean"] + grouped["sem"],
+                         color=color, alpha=0.25)
+    ax.axhline(0, color="gray", linestyle="--")
+    ax.axvline(0, color="crimson", linestyle=":", label="fatigue onset")
+    ax.set_xlabel("Time to fatigue onset (s)")
+    ax.set_ylabel("Baseline-normalised power (group mean \u00b1 SE)")
+    ax.set_title("Temporal evolution of frontal theta/alpha power before fatigue onset")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_dir / "group_temporal_evolution.png", dpi=150)
+    plt.close(fig)
+
+
 def _group_descriptive_only(participant_means_df: pd.DataFrame, value_col: str) -> Dict[str, object]:
     """
     Descriptive-only group-level summary (no inferential test), for
-    exploratory outcomes. Per the methodology, only the predefined primary
-    outcomes (frontal theta and frontal alpha power) are tested against
-    zero; beta-band activity and the TP9/TP10 electrodes are exploratory
-    and are interpreted descriptively, not tested for significance.
+    exploratory outcomes. 
     """
     x = participant_means_df[value_col].dropna().to_numpy(dtype=float)
     return {
@@ -233,11 +415,7 @@ def _group_descriptive_only(participant_means_df: pd.DataFrame, value_col: str) 
 def group_analysis(participant_means: List[Dict[str, object]], out_dir: Union[str, Path]) -> None:
     """
     Run group-level statistics (step 8-9 in the module docstring) across all
-    participants with a detected fatigue onset. Only the predefined primary
-    outcomes (frontal theta and alpha power) are tested against zero
-    (one-sample t-test / Wilcoxon signed-rank); the remaining channel/band
-    combinations (TP9, TP10, and beta) are summarised descriptively only.
-    Saves a group participant-means CSV and a group-level stats CSV.
+    participants with a detected fatigue onset.
     """
     out_dir = Path(out_dir)
     df = pd.DataFrame(participant_means)
@@ -276,8 +454,8 @@ def group_analysis(participant_means: List[Dict[str, object]], out_dir: Union[st
 def main() -> None:
     """
     Parse CLI arguments, discover participants, run the per-participant
-    pipeline for each, then run group-level analysis across all participants
-    with a detected fatigue onset.
+    pipeline for each, then run group-level analysis and group-level figures
+    across all participants with a detected fatigue onset and valid EEG data.
     """
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-dir", required=True)
@@ -291,14 +469,40 @@ def main() -> None:
 
     all_results = []
     participant_means = []
+    all_stats_dfs = []
+    all_aligned_windows = []
+    all_prefatigue_norm = []
     for pid, eeg_path, exp_path in participants:
-        result, stats_df, p_means = process_participant(pid, eeg_path, exp_path, args.out_dir)
+        result, stats_df, p_means, aligned_windows, prefatigue_norm = process_participant(
+            pid, eeg_path, exp_path, args.out_dir
+        )
         all_results.append(result)
         if p_means is not None:
             participant_means.append(p_means)
+        if stats_df is not None:
+            all_stats_dfs.append(stats_df)
+        if aligned_windows is not None:
+            all_aligned_windows.append(aligned_windows)
+        if prefatigue_norm is not None:
+            all_prefatigue_norm.append(prefatigue_norm)
 
     pd.DataFrame(all_results).to_csv(Path(args.out_dir) / "all_participants_summary.csv", index=False)
     group_analysis(participant_means, args.out_dir)
+
+    combined_stats_df = pd.concat(all_stats_dfs, ignore_index=True) if all_stats_dfs else pd.DataFrame()
+    combined_aligned_windows = (
+        pd.concat(all_aligned_windows, ignore_index=True) if all_aligned_windows else pd.DataFrame()
+    )
+    combined_prefatigue_norm = (
+        pd.concat(all_prefatigue_norm, ignore_index=True) if all_prefatigue_norm else pd.DataFrame()
+    )
+
+    make_group_behavioral_trajectory_figure(combined_aligned_windows, args.out_dir)
+    make_group_baseline_prefatigue_figure(combined_stats_df, "theta", args.out_dir)
+    make_group_baseline_prefatigue_figure(combined_stats_df, "alpha", args.out_dir)
+    make_group_change_figure(combined_stats_df, args.out_dir)
+    make_group_exploratory_change_figure(combined_stats_df, args.out_dir)
+    make_group_temporal_evolution_figure(combined_prefatigue_norm, args.out_dir)
 
 
 if __name__ == "__main__":
