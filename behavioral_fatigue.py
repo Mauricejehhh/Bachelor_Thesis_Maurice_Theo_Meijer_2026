@@ -69,6 +69,18 @@ def sliding_window_performance(exp_df: pd.DataFrame, window_size: int = BEH_WIND
     return pd.DataFrame(rows)
 
 
+def align_windows_to_onset(windows_df: pd.DataFrame, onset_time_s: float) -> pd.DataFrame:
+    """
+    Add a 'time_to_onset' column (t_start_s - onset_time_s; seconds, 0 =
+    fatigue onset) to a behavioural sliding-window DataFrame, so behavioural
+    trajectories from different participants can be aligned and compared on
+    a common time-to-onset axis.
+    """
+    out = windows_df.copy()
+    out["time_to_onset"] = out["t_start_s"] - onset_time_s
+    return out
+
+
 def detect_fatigue_onset(windows_df: pd.DataFrame, baseline_error_rate: float,
                          consec: int = FATIGUE_CONSEC_WINDOWS) -> Dict[str, object]:
     """
@@ -76,7 +88,8 @@ def detect_fatigue_onset(windows_df: pd.DataFrame, baseline_error_rate: float,
     participant's baseline error rate.
 
     Returns a dict with onset info and 'fatigue_detected': True, or
-    {'fatigue_detected': False} if the criterion was never met.
+    {'fatigue_detected': False} if the criterion was never met
+    (participant reported descriptively, excluded from EEG fatigue-onset analysis).
     """
     above = (windows_df["error_rate"] > baseline_error_rate).to_numpy()
 
