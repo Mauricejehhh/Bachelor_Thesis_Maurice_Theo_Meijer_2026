@@ -3,9 +3,10 @@ EEG preprocessing: band-pass + notch filtering,
 and window-level artifact flagging.
 """
 
-from typing import Dict, List, Sequence, pd
+from typing import Dict, List, Sequence
 
 import numpy as np
+import pandas as pd
 from scipy.signal import butter, filtfilt, iirnotch
 
 from config import (
